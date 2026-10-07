@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import os
 import os.path
 import re
 
+import pytest
 import re_assert
 
 import pre_commit.constants as C
 from pre_commit import git
+from pre_commit.commands import install_uninstall
 from pre_commit.commands.install_uninstall import _hook_types
 from pre_commit.commands.install_uninstall import CURRENT_HASH
 from pre_commit.commands.install_uninstall import install
 from pre_commit.commands.install_uninstall import install_hooks
 from pre_commit.commands.install_uninstall import is_our_script
 from pre_commit.commands.install_uninstall import PRIOR_HASHES
+from pre_commit.commands.install_uninstall import TEMPLATE_END
+from pre_commit.commands.install_uninstall import TEMPLATE_START
 from pre_commit.commands.install_uninstall import uninstall
 from pre_commit.parse_shebang import find_executable
 from pre_commit.util import cmd_output
@@ -243,6 +248,182 @@ def test_install_idempotent(tempdir_factory, store):
         ret, output = _get_commit_output(tempdir_factory)
         assert ret == 0
         NORMAL_PRE_COMMIT_RUN.assert_matches(output)
+
+
+def test_install_preserves_user_changes_outside_templated_section(
+        in_git_dir, store,
+):
+    hook = in_git_dir.join('.git/hooks/pre-commit')
+    install(C.CONFIG_FILE, store, hook_types=['pre-commit'])
+
+    src = hook.read()
+    # user additions both above and below the templated section
+    src = src.replace('# ID:', '# user note\n# ID:', 1)
+    src = src.replace(
+        TEMPLATE_END,
+        f'{TEMPLATE_END}export PRE_COMMIT_USER_ENV=1\n'
+        f"echo 'user log line' >&2\n",
+        1,
+    )
+    hook.write(src)
+
+    # reinstall with different settings -- only the templated section changes
+    install('custom-config.yaml', store, hook_types=['pre-commit'])
+
+    new = hook.read()
+    assert '# user note\n' in new
+    assert 'export PRE_COMMIT_USER_ENV=1\n' in new
+    assert "echo 'user log line' >&2\n" in new
+    assert '--config=custom-config.yaml' in new
+    assert f'--config={C.CONFIG_FILE}' not in new
+    assert new.count(TEMPLATE_START) == 1
+    assert new.count(TEMPLATE_END) == 1
+    assert os.access(hook.strpath, os.X_OK)
+
+
+def test_install_does_not_rewrite_unchanged_hook(in_git_dir, store):
+    hook = in_git_dir.join('.git/hooks/pre-commit').strpath
+    install(C.CONFIG_FILE, store, hook_types=['pre-commit'])
+    stat1 = os.stat(hook)
+
+    install(C.CONFIG_FILE, store, hook_types=['pre-commit'])
+    stat2 = os.stat(hook)
+    assert stat2.st_ino == stat1.st_ino
+    assert stat2.st_mtime_ns == stat1.st_mtime_ns
+
+    # changing settings rewrites the file once, the repeat is a no-op again
+    install('custom.yaml', store, hook_types=['pre-commit'])
+    stat3 = os.stat(hook)
+    assert stat3.st_ino != stat1.st_ino
+    install('custom.yaml', store, hook_types=['pre-commit'])
+    stat4 = os.stat(hook)
+    assert stat4.st_ino == stat3.st_ino
+    assert stat4.st_mtime_ns == stat3.st_mtime_ns
+
+
+def test_install_failure_during_staging_changes_nothing(
+        in_git_dir, store, monkeypatch,
+):
+    hooks_dir = in_git_dir.join('.git/hooks')
+    install(C.CONFIG_FILE, store, hook_types=['pre-commit', 'pre-push'])
+
+    for name in ('pre-commit', 'pre-push'):
+        hook = hooks_dir.join(name)
+        hook.write(
+            hook.read().replace(
+                TEMPLATE_END, f'{TEMPLATE_END}export USER_STUFF=x\n', 1,
+            ),
+        )
+
+    paths = {name: hooks_dir.join(name).strpath
+             for name in ('pre-commit', 'pre-push')}
+    expected = {name: open(path).read() for name, path in paths.items()}
+    inos = {name: os.stat(path).st_ino for name, path in paths.items()}
+
+    def _boom(fd: int) -> None:
+        raise OSError('simulated staging failure')
+
+    monkeypatch.setattr(install_uninstall.os, 'fsync', _boom)
+
+    with pytest.raises(OSError):
+        # different config so the scripts would actually be rewritten
+        install(
+            'custom.yaml', store, hook_types=['pre-commit', 'pre-push'],
+        )
+
+    for name, path in paths.items():
+        assert open(path).read() == expected[name]
+        assert os.stat(path).st_ino == inos[name]
+        assert os.access(path, os.X_OK)
+    assert [
+        x for x in os.listdir(hooks_dir.strpath) if x.endswith('.tmp')
+    ] == []
+
+
+def test_install_failure_leaves_complete_hook_script(
+        in_git_dir, store, monkeypatch,
+):
+    hook = in_git_dir.join('.git/hooks/pre-commit').strpath
+    install(C.CONFIG_FILE, store, hook_types=['pre-commit'])
+    with open(hook) as f:
+        expected = f.read()
+
+    # fail while swapping the newly staged script into place
+    real_replace = install_uninstall.os.replace
+    calls = 0
+
+    def _maybe_fail(src: str, dst: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError('simulated rename failure')
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(install_uninstall.os, 'replace', _maybe_fail)
+
+    with pytest.raises(OSError):
+        # different config so the script would actually be rewritten
+        install('custom.yaml', store, hook_types=['pre-commit'])
+
+    with open(hook) as f:
+        assert f.read() == expected
+    assert os.access(hook, os.X_OK)
+    assert is_our_script(hook)
+    hooks_dir = os.path.dirname(hook)
+    assert [x for x in os.listdir(hooks_dir) if x.endswith('.tmp')] == []
+    assert not os.path.exists(f'{hook}.legacy')
+
+
+def test_install_multi_hook_failure_rolls_back_everything(
+        in_git_dir, store, monkeypatch,
+):
+    hooks_dir = in_git_dir.join('.git/hooks')
+    install(C.CONFIG_FILE, store, hook_types=['pre-commit', 'pre-push'])
+
+    paths = {
+        name: hooks_dir.join(name).strpath
+        for name in ('pre-commit', 'pre-push')
+    }
+    for path in paths.values():
+        with open(path) as f:
+            src = f.read()
+        with open(path, 'w') as f:
+            f.write(
+                src.replace(
+                    TEMPLATE_END, f'{TEMPLATE_END}export USER_STUFF=x\n', 1,
+                ),
+            )
+
+    expected = {name: open(path).read() for name, path in paths.items()}
+
+    # reinstalling each hook parks the old script (1) and swaps the new
+    # one in (2) -- fail while parking the second hook
+    real_replace = install_uninstall.os.replace
+    calls = 0
+
+    def _maybe_fail(src: str, dst: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError('simulated rename failure')
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(install_uninstall.os, 'replace', _maybe_fail)
+
+    with pytest.raises(OSError):
+        # different config so the scripts would actually be rewritten
+        install(
+            'custom.yaml', store, hook_types=['pre-commit', 'pre-push'],
+        )
+
+    for name, path in paths.items():
+        assert open(path).read() == expected[name]
+        assert os.access(path, os.X_OK)
+        assert is_our_script(path)
+        assert not os.path.exists(f'{path}.legacy')
+    assert [
+        x for x in os.listdir(hooks_dir.strpath) if x.endswith('.tmp')
+    ] == []
 
 
 def _path_without_us():

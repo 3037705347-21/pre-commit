@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import os.path
 import shlex
-import shutil
+import stat
 import sys
+import tempfile
+from typing import NamedTuple
 
 from pre_commit import git
 from pre_commit import output
@@ -13,7 +17,6 @@ from pre_commit.clientlib import load_config
 from pre_commit.repository import all_hooks
 from pre_commit.repository import install_hook_envs
 from pre_commit.store import Store
-from pre_commit.util import make_executable
 from pre_commit.util import resource_text
 
 
@@ -61,54 +64,227 @@ def is_our_script(filename: str) -> bool:
     return any(h in contents for h in (CURRENT_HASH,) + PRIOR_HASHES)
 
 
-def _install_hook_script(
+def _render_hook(
+        existing: str | None,
         config_file: str,
         hook_type: str,
-        overwrite: bool = False,
-        skip_on_missing_config: bool = False,
-        git_dir: str | None = None,
-) -> None:
-    hook_path, legacy_path = _hook_paths(hook_type, git_dir=git_dir)
+        skip_on_missing_config: bool,
+) -> str:
+    """Render the desired hook script.
 
-    os.makedirs(os.path.dirname(hook_path), exist_ok=True)
+    Only the section between ``TEMPLATE_START`` and ``TEMPLATE_END`` is
+    maintained by pre-commit -- anything an existing installation contains
+    outside of these markers is preserved verbatim.
+    """
+    contents = resource_text('hook-tmpl')
+    before, rest = contents.split(TEMPLATE_START)
+    _, after = rest.split(TEMPLATE_END)
 
-    # If we have an existing hook, move it to pre-commit.legacy
-    if os.path.lexists(hook_path) and not is_our_script(hook_path):
-        shutil.move(hook_path, legacy_path)
+    # on windows always use `/bin/sh` since `bash` might not be on PATH
+    # though we use bash-specific features `sh` on windows is actually
+    # bash in "POSIXLY_CORRECT" mode which still supports the features we
+    # use: subshells / arrays
+    windows_shebang = sys.platform == 'win32'  # pragma: win32 cover
 
-    # If we specify overwrite, we simply delete the legacy file
-    if overwrite and os.path.exists(legacy_path):
-        os.remove(legacy_path)
-    elif os.path.exists(legacy_path):
-        output.write_line(
-            f'Running in migration mode with existing hooks at {legacy_path}\n'
-            f'Use -f to use only pre-commit.',
-        )
+    if existing is not None:
+        start = existing.find(TEMPLATE_START)
+        end = existing.find(TEMPLATE_END)
+        if 0 <= start < end:
+            # keep the user's portions of the script untouched
+            before = existing[:start]
+            after = existing[end + len(TEMPLATE_END):]
+            windows_shebang = False
 
     args = ['hook-impl', f'--config={config_file}', f'--hook-type={hook_type}']
     if skip_on_missing_config:
         args.append('--skip-on-missing-config')
 
-    with open(hook_path, 'w') as hook_file:
-        contents = resource_text('hook-tmpl')
-        before, rest = contents.split(TEMPLATE_START)
-        _, after = rest.split(TEMPLATE_END)
+    ret = ''
+    if windows_shebang:  # pragma: win32 cover
+        ret += '#!/bin/sh\n'
+    ret += before
+    ret += TEMPLATE_START
+    ret += f'INSTALL_PYTHON={shlex.quote(sys.executable)}\n'
+    ret += f'ARGS=({shlex.join(args)})\n'
+    ret += TEMPLATE_END
+    ret += after
+    return ret
 
-        # on windows always use `/bin/sh` since `bash` might not be on PATH
-        # though we use bash-specific features `sh` on windows is actually
-        # bash in "POSIXLY_CORRECT" mode which still supports the features we
-        # use: subshells / arrays
-        if sys.platform == 'win32':  # pragma: win32 cover
-            hook_file.write('#!/bin/sh\n')
 
-        hook_file.write(before + TEMPLATE_START)
-        hook_file.write(f'INSTALL_PYTHON={shlex.quote(sys.executable)}\n')
-        args_s = shlex.join(args)
-        hook_file.write(f'ARGS=({args_s})\n')
-        hook_file.write(TEMPLATE_END + after)
-    make_executable(hook_path)
+class _PendingHook(NamedTuple):
+    hook_path: str
+    legacy_path: str
+    contents: str
+    unchanged: bool
+    # an existing non-pre-commit hook is moved to the legacy path
+    migrate_legacy: bool
+    # the legacy hook is removed on install (-f)
+    overwrite: bool
+    mode: int
 
-    output.write_line(f'pre-commit installed at {hook_path}')
+
+def _prepare_hook_install(
+        config_file: str,
+        hook_type: str,
+        overwrite: bool,
+        skip_on_missing_config: bool,
+        git_dir: str | None,
+        created_dirs: list[str],
+) -> _PendingHook:
+    hook_path, legacy_path = _hook_paths(hook_type, git_dir=git_dir)
+
+    hooks_dir = os.path.dirname(hook_path)
+    if not os.path.isdir(hooks_dir):
+        os.makedirs(hooks_dir, exist_ok=True)
+        created_dirs.append(hooks_dir)
+
+    existing: str | None = None
+    migrate_legacy = False
+    mode = 0o755
+    if os.path.lexists(hook_path):
+        if is_our_script(hook_path):
+            with open(hook_path) as f:
+                existing = f.read()
+            mode = stat.S_IMODE(os.stat(hook_path).st_mode)
+        else:
+            migrate_legacy = True
+
+    contents = _render_hook(
+        existing, config_file, hook_type, skip_on_missing_config,
+    )
+
+    return _PendingHook(
+        hook_path=hook_path,
+        legacy_path=legacy_path,
+        contents=contents,
+        unchanged=existing == contents,
+        migrate_legacy=migrate_legacy,
+        overwrite=overwrite,
+        mode=mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
+    )
+
+
+def _tmp_sibling(path: str) -> str:
+    directory = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=f'.{os.path.basename(path)}.',
+        suffix='.tmp',
+    )
+    os.close(fd)
+    return tmp_path
+
+
+def _stage_contents(path: str, contents: str, mode: int) -> str:
+    """Write ``contents`` next to ``path`` without touching ``path``.
+
+    The file is fully written, fsynced and made executable before it is
+    moved into place by the caller, so an interrupted install can never
+    leave a half-written hook script behind.
+    """
+    directory = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory,
+        prefix=f'.{os.path.basename(path)}.',
+        suffix='.tmp',
+    )
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(contents)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, mode)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+    return tmp_path
+
+
+def _install_prepared(pending: list[_PendingHook]) -> None:
+    """Install all prepared hooks, all or nothing.
+
+    New contents are staged first and existing files are only displaced by
+    atomic renames.  If anything fails for any hook every prior rename is
+    reversed, leaving all hook scripts in their original state.
+    """
+    # (src, dst) renames which reverse a rename already performed
+    undos: list[tuple[str, str]] = []
+    leftovers: list[str] = []
+
+    def _replace(src: str, dst: str) -> None:
+        os.replace(src, dst)
+        undos.append((dst, src))
+
+    try:
+        # stage every new script before modifying any existing one
+        staged: dict[str, str] = {}
+        for p in pending:
+            if not p.unchanged:
+                tmp_path = _stage_contents(p.hook_path, p.contents, p.mode)
+                staged[p.hook_path] = tmp_path
+                leftovers.append(tmp_path)
+
+        for p in pending:
+            if p.unchanged:
+                # the script is already in the desired state -- don't touch
+                # the file so its mtime / inode / permissions are preserved
+                output.write_line(f'pre-commit installed at {p.hook_path}')
+                continue
+
+            hook_path = p.hook_path
+            legacy_path = p.legacy_path
+
+            # the existing legacy hook is either replaced by the migrated
+            # hook or removed when overwriting -- park it so the move can be
+            # rolled back
+            if (
+                    os.path.lexists(legacy_path) and
+                    (p.migrate_legacy or p.overwrite)
+            ):
+                legacy_backup = _tmp_sibling(legacy_path)
+                leftovers.append(legacy_backup)
+                _replace(legacy_path, legacy_backup)
+
+            if p.migrate_legacy:
+                # move the existing non-pre-commit hook out of the way
+                _replace(hook_path, legacy_path)
+            elif os.path.lexists(hook_path):
+                # park our existing script so its bytes survive a rollback
+                hook_backup = _tmp_sibling(hook_path)
+                leftovers.append(hook_backup)
+                _replace(hook_path, hook_backup)
+
+            _replace(staged[hook_path], hook_path)
+
+            # with --overwrite the migrated hook is discarded -- it is
+            # parked rather than deleted so a rollback can still restore it
+            if p.overwrite and os.path.lexists(legacy_path):
+                legacy_trash = _tmp_sibling(legacy_path)
+                leftovers.append(legacy_trash)
+                _replace(legacy_path, legacy_trash)
+
+            output.write_line(f'pre-commit installed at {hook_path}')
+
+            if not p.overwrite and os.path.lexists(legacy_path):
+                output.write_line(
+                    f'Running in migration mode with existing hooks at '
+                    f'{legacy_path}\n'
+                    f'Use -f to use only pre-commit.',
+                )
+    except BaseException:
+        for src, dst in reversed(undos):
+            with contextlib.suppress(OSError):
+                if os.path.lexists(src):
+                    os.replace(src, dst)
+        for leftover in leftovers:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(leftover)
+        raise
+    else:
+        for leftover in leftovers:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(leftover)
 
 
 def install(
@@ -127,13 +303,26 @@ def install(
         )
         return 1
 
-    for hook_type in _hook_types(config_file, hook_types):
-        _install_hook_script(
-            config_file, hook_type,
-            overwrite=overwrite,
-            skip_on_missing_config=skip_on_missing_config,
-            git_dir=git_dir,
-        )
+    created_dirs: list[str] = []
+    try:
+        pending = [
+            _prepare_hook_install(
+                config_file, hook_type,
+                overwrite=overwrite,
+                skip_on_missing_config=skip_on_missing_config,
+                git_dir=git_dir,
+                created_dirs=created_dirs,
+            )
+            for hook_type in _hook_types(config_file, hook_types)
+        ]
+    except BaseException:
+        # only directories which did not previously exist are removed
+        for directory in reversed(created_dirs):
+            with contextlib.suppress(OSError):
+                os.rmdir(directory)
+        raise
+
+    _install_prepared(pending)
 
     if hooks:
         install_hooks(config_file, store)
