@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import os.path
 import re
 import tempfile
@@ -100,6 +101,14 @@ def _check_hooks_still_exist_at_rev(
         )
 
 
+def _failure_message(e: CalledProcessError) -> str:
+    # git reports connection failures (and similar) on stderr
+    for part in (e.stderr, e.stdout):
+        if part:
+            return part.decode(errors='replace').strip()
+    return f'git exited with return code {e.returncode}'
+
+
 def _update_one(
         i: int,
         repo: dict[str, Any],
@@ -108,37 +117,45 @@ def _update_one(
         freeze: bool,
 ) -> tuple[int, RevInfo, RevInfo]:
     old = RevInfo.from_config(repo)
-    new = old.update(tags_only=tags_only, freeze=freeze)
-    _check_hooks_still_exist_at_rev(repo, new)
+    try:
+        new = old.update(tags_only=tags_only, freeze=freeze)
+        _check_hooks_still_exist_at_rev(repo, new)
+    except RepositoryCannotBeUpdatedError:
+        # the message already identifies the repository
+        raise
+    except CalledProcessError as e:
+        raise RepositoryCannotBeUpdatedError(
+            f'[{old.repo}] {_failure_message(e)}',
+        ) from e
     return i, old, new
 
 
 REV_LINE_RE = re.compile(r'^(\s+)rev:(\s*)([\'"]?)([^\s#]+)(.*)(\r?\n)$')
 
 
-def _original_lines(
-        path: str,
+def _rewritten_lines(
+        contents: str,
         rev_infos: list[RevInfo | None],
         retry: bool = False,
 ) -> tuple[list[str], list[int]]:
-    """detect `rev:` lines or reformat the file"""
-    with open(path, newline='') as f:
-        original = f.read()
-
-    lines = original.splitlines(True)
+    """detect `rev:` lines or reformat the contents (in memory)"""
+    lines = contents.splitlines(True)
     idxs = [i for i, line in enumerate(lines) if REV_LINE_RE.match(line)]
     if len(idxs) == len(rev_infos):
         return lines, idxs
     elif retry:
         raise AssertionError('could not find rev lines')
     else:
-        with open(path, 'w') as f:
-            f.write(yaml_dump(yaml_load(original)))
-        return _original_lines(path, rev_infos, retry=True)
+        return _rewritten_lines(
+            yaml_dump(yaml_load(contents)), rev_infos, retry=True,
+        )
 
 
-def _write_new_config(path: str, rev_infos: list[RevInfo | None]) -> None:
-    lines, idxs = _original_lines(path, rev_infos)
+def _new_config_contents(
+        original: str,
+        rev_infos: list[RevInfo | None],
+) -> str:
+    lines, idxs = _rewritten_lines(original, rev_infos)
 
     for idx, rev_info in zip(idxs, rev_infos):
         if rev_info is None:
@@ -155,8 +172,35 @@ def _write_new_config(path: str, rev_infos: list[RevInfo | None]) -> None:
             comment = match[5]
         lines[idx] = f'{match[1]}rev:{match[2]}{new_rev}{comment}{match[6]}'
 
-    with open(path, 'w', newline='') as f:
-        f.write(''.join(lines))
+    return ''.join(lines)
+
+
+def _atomic_write(path: str, contents: str) -> None:
+    """write the file atomically so the original is intact on failure"""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix='.pre-commit-autoupdate-', suffix='.tmp',
+    )
+    try:
+        with os.fdopen(fd, 'w', newline='') as f:
+            f.write(contents)
+        os.chmod(tmp_path, os.stat(path).st_mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _write_new_config(path: str, rev_infos: list[RevInfo | None]) -> None:
+    with open(path, newline='') as f:
+        original = f.read()
+
+    new_contents = _new_config_contents(original, rev_infos)
+    if new_contents != original:
+        _atomic_write(path, new_contents)
 
 
 def autoupdate(
@@ -168,7 +212,6 @@ def autoupdate(
 ) -> int:
     """Auto-update the pre-commit config to the latest versions of repos."""
     migrate_config(config_file, quiet=True)
-    changed = False
     retv = 0
 
     config_repos = [
@@ -204,7 +247,6 @@ def autoupdate(
                 retv = 1
             else:
                 if new.rev != old.rev:
-                    changed = True
                     if new.frozen:
                         new_s = f'{new.frozen} (frozen)'
                     else:
@@ -216,7 +258,9 @@ def autoupdate(
 
                 output.write_line(f'[{old.repo}] {msg}')
 
-    if changed:
+    # the config is rewritten atomically, and only when every repository
+    # could be updated -- a failure leaves the file completely untouched
+    if retv == 0:
         _write_new_config(config_file, rev_infos)
 
     return retv

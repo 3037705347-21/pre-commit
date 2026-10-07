@@ -10,6 +10,7 @@ from pre_commit import envcontext
 from pre_commit import git
 from pre_commit import yaml
 from pre_commit.commands.autoupdate import _check_hooks_still_exist_at_rev
+from pre_commit.commands.autoupdate import _update_one
 from pre_commit.commands.autoupdate import autoupdate
 from pre_commit.commands.autoupdate import RepositoryCannotBeUpdatedError
 from pre_commit.commands.autoupdate import RevInfo
@@ -420,6 +421,54 @@ def test_autoupdate_latest_no_config(out_of_date, in_tmpdir):
     assert autoupdate(C.CONFIG_FILE, freeze=False, tags_only=False) == 1
     with open(C.CONFIG_FILE) as f:
         assert out_of_date.original_rev in f.read()
+
+
+@pytest.mark.parametrize('jobs', (1, 2))
+def test_autoupdate_failure_leaves_config_untouched(
+        out_of_date, tmpdir, cap_out, jobs,
+):
+    # one repo cannot be fetched while another has an update available --
+    # the whole update must be abandoned (no partial rewrite)
+    unreachable = str(tmpdir.join('does-not-exist'))
+    fmt = (
+        'repos:\n'
+        '-   repo: {}\n'
+        '    rev: v0\n'
+        '    hooks:\n'
+        '    -   id: foo\n'
+        '-   repo: {}\n'
+        '    rev: {}\n'
+        '    hooks:\n'
+        '    -   id: foo\n'
+    )
+    cfg = tmpdir.join(C.CONFIG_FILE)
+    before = fmt.format(
+        unreachable,
+        out_of_date.path,
+        out_of_date.original_rev,
+    )
+    cfg.write(before)
+
+    assert (
+        autoupdate(
+            str(cfg), freeze=False, tags_only=False, jobs=jobs,
+        ) == 1
+    )
+    # the file is byte-for-byte unchanged
+    assert cfg.read() == before
+    # the failing repository is called out explicitly
+    assert f'[{unreachable}]' in cap_out.get()
+    # the updatable repo was not updated either
+    assert out_of_date.original_rev in cfg.read()
+    assert out_of_date.head_rev not in cfg.read()
+
+
+def test_update_one_wraps_failure_with_repo_name(tmpdir):
+    unreachable = str(tmpdir.join('does-not-exist'))
+    repo = {'repo': unreachable, 'rev': 'v0'}
+    with pytest.raises(RepositoryCannotBeUpdatedError) as excinfo:
+        _update_one(0, repo, tags_only=False, freeze=False)
+    assert f'[{unreachable}]' in str(excinfo.value)
 
 
 def test_hook_disppearing_repo_raises(hook_disappearing):
