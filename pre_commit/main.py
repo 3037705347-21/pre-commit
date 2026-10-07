@@ -377,7 +377,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     with error_handler(), logging_handler(args.color):
         git.check_for_cygwin_mismatch()
 
-        store = Store()
+        # `clean` wipes the whole cache, so it must still work on a cache
+        # written by a newer (or an otherwise unreadable) pre-commit.
+        store = Store(reconcile_schema=args.command != 'clean')
 
         if args.command not in COMMANDS_NO_GIT:
             _adjust_args_and_chdir(args)

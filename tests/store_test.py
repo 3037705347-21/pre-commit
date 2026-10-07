@@ -1,18 +1,26 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os.path
 import shlex
 import sqlite3
 import stat
+import subprocess
+import sys
 from unittest import mock
 
 import pytest
 
 import pre_commit.constants as C
 from pre_commit import git
+from pre_commit import main
+from pre_commit.commands.gc import gc
+from pre_commit.errors import FatalError
 from pre_commit.store import _get_default_directory
 from pre_commit.store import _LOCAL_RESOURCES
+from pre_commit.store import _SCHEMA_MIGRATIONS
+from pre_commit.store import CURRENT_SCHEMA_VERSION
 from pre_commit.store import Store
 from pre_commit.util import CalledProcessError
 from pre_commit.util import cmd_output
@@ -341,3 +349,308 @@ def test_clone_with_recursive_submodules(store, tmp_path):
     assert os.path.exists(ret)
     assert os.path.exists(os.path.join(ret, str(repo), 'repository'))
     assert os.path.exists(os.path.join(ret, str(sub), 'submodule'))
+
+
+# ---------------------------------------------------------------------------
+# schema version reconciliation
+
+_LEGACY_REPO_ROWS = [
+    ('https://example.com/repo', 'v1', '/cache/repo1'),
+    ('local', C.LOCAL_REPO_VERSION, '/cache/repo2'),
+]
+_LEGACY_CONFIG_ROWS = [('/home/user/.pre-commit-config.yaml')]
+
+
+def _user_version(db_path: str) -> int:
+    with sqlite3.connect(f'file:{db_path}?mode=ro', uri=True) as db:
+        return db.execute('PRAGMA user_version').fetchone()[0]
+
+
+def _table_names(db_path: str) -> set[str]:
+    with sqlite3.connect(f'file:{db_path}?mode=ro', uri=True) as db:
+        return {
+            row[0]
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'",
+            )
+        }
+
+
+def _write_legacy_db(home: str, *, with_configs: bool) -> str:
+    """Write a database as produced before schema versioning existed
+    (`user_version == 0`)."""
+    os.makedirs(home)
+    db_path = os.path.join(home, 'db.db')
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            'CREATE TABLE repos ('
+            '    repo TEXT NOT NULL,'
+            '    ref TEXT NOT NULL,'
+            '    path TEXT NOT NULL,'
+            '    PRIMARY KEY (repo, ref)'
+            ')',
+        )
+        db.executemany('INSERT INTO repos VALUES (?, ?, ?)', _LEGACY_REPO_ROWS)
+        if with_configs:
+            db.execute(
+                'CREATE TABLE configs ('
+                '   path TEXT NOT NULL,'
+                '   PRIMARY KEY (path)'
+                ')',
+            )
+            db.executemany(
+                'INSERT INTO configs VALUES (?)',
+                [(p,) for p in _LEGACY_CONFIG_ROWS],
+            )
+    assert _user_version(db_path) == 0
+    return db_path
+
+
+def _digest(path: str) -> tuple[int, int, bytes]:
+    with open(path, 'rb') as f:
+        return (
+            os.stat(path).st_size,
+            os.stat(path).st_mtime_ns,
+            hashlib.sha256(f.read()).digest(),
+        )
+
+
+def test_fresh_db_records_current_schema_version(store):
+    assert _user_version(store.db_path) == CURRENT_SCHEMA_VERSION
+    # the historical table structure is created unchanged
+    with store.connect() as db:
+        repos_cols = [r[1] for r in db.execute('PRAGMA table_info(repos)')]
+        configs_cols = [
+            r[1] for r in db.execute('PRAGMA table_info(configs)')
+        ]
+    assert repos_cols == ['repo', 'ref', 'path']
+    assert configs_cols == ['path']
+
+
+def test_legacy_db_without_configs_is_migrated_and_rows_kept(tmpdir):
+    home = tmpdir.join('store').strpath
+    db_path = _write_legacy_db(home, with_configs=False)
+
+    store = Store(home)
+
+    assert _user_version(db_path) == CURRENT_SCHEMA_VERSION
+    assert 'configs' in _table_names(db_path)
+    assert _select_all_repos(store) == _LEGACY_REPO_ROWS
+    assert _select_all_configs(store) == []
+
+
+def test_legacy_db_with_configs_is_stamped_and_rows_kept(tmpdir):
+    home = tmpdir.join('store').strpath
+    db_path = _write_legacy_db(home, with_configs=True)
+
+    store = Store(home)
+
+    assert _user_version(db_path) == CURRENT_SCHEMA_VERSION
+    assert _select_all_repos(store) == _LEGACY_REPO_ROWS
+    assert _select_all_configs(store) == _LEGACY_CONFIG_ROWS
+
+
+def test_opening_current_version_db_does_not_write(store):
+    before = _digest(store.db_path)
+    Store(store.directory)
+    Store(store.directory)
+    assert _digest(store.db_path) == before
+
+
+def test_future_schema_version_is_fatal_and_untouched(store):
+    with sqlite3.connect(store.db_path) as db:
+        db.execute(f'PRAGMA user_version = {CURRENT_SCHEMA_VERSION + 1}')
+        db.commit()
+    before = _digest(store.db_path)
+
+    with pytest.raises(FatalError) as excinfo:
+        Store(store.directory)
+
+    msg = str(excinfo.value)
+    assert str(CURRENT_SCHEMA_VERSION + 1) in msg
+    assert store.db_path in msg
+    assert _digest(store.db_path) == before
+    assert _user_version(store.db_path) == CURRENT_SCHEMA_VERSION + 1
+
+
+def test_future_schema_version_cli_exits_nonzero(mock_store_dir, cap_out):
+    Store()
+    db_path = os.path.join(mock_store_dir, 'db.db')
+    with sqlite3.connect(db_path) as db:
+        db.execute('PRAGMA user_version = 99')
+        db.commit()
+
+    with pytest.raises(SystemExit) as excinfo:
+        main.main(('gc',))
+    assert excinfo.value.code == 1
+
+    out = cap_out.get()
+    assert 'An error has occurred: FatalError' in out
+    assert 'schema version 99' in out
+    assert _user_version(db_path) == 99
+
+
+def test_clean_still_works_on_future_schema(mock_store_dir, cap_out, tmpdir):
+    Store()
+    db_path = os.path.join(mock_store_dir, 'db.db')
+    with sqlite3.connect(db_path) as db:
+        db.execute('PRAGMA user_version = 99')
+        db.commit()
+
+    fake_legacy = tmpdir.join('legacy').strpath
+    os.makedirs(fake_legacy)
+    with mock.patch.object(
+            os.path, 'expanduser', return_value=fake_legacy,
+    ):
+        assert main.main(('clean',)) == 0
+    assert not os.path.exists(db_path)
+    assert cap_out.get().startswith('Cleaned ')
+
+
+def test_unrecognized_database_is_not_modified(tmpdir):
+    home = tmpdir.join('store').strpath
+    os.makedirs(home)
+    db_path = os.path.join(home, 'db.db')
+    with sqlite3.connect(db_path) as db:
+        db.execute('CREATE TABLE unrelated (thing TEXT)')
+        db.commit()
+    before = _digest(db_path)
+
+    with pytest.raises(FatalError):
+        Store(home)
+    assert _digest(db_path) == before
+
+
+def test_failed_migration_rolls_back_and_rerun_converges(tmpdir):
+    home = tmpdir.join('store').strpath
+    db_path = _write_legacy_db(home, with_configs=False)
+
+    def _fail_after_ddl(db):
+        db.execute(
+            'CREATE TABLE IF NOT EXISTS configs ('
+            '   path TEXT NOT NULL,'
+            '   PRIMARY KEY (path)'
+            ')',
+        )
+        raise RuntimeError('simulated failure mid-migration')
+
+    with mock.patch.dict(_SCHEMA_MIGRATIONS, {1: _fail_after_ddl}):
+        with pytest.raises(RuntimeError):
+            Store(home)
+
+    # the half-applied migration was rolled back -- nothing is committed
+    assert _user_version(db_path) == 0
+    assert 'configs' not in _table_names(db_path)
+    with sqlite3.connect(db_path) as db:
+        repos_rows = db.execute('SELECT * FROM repos').fetchall()
+        assert repos_rows == _LEGACY_REPO_ROWS
+
+    # running again (with the real migration) converges
+    store = Store(home)
+    assert _user_version(db_path) == CURRENT_SCHEMA_VERSION
+    assert _select_all_repos(store) == _LEGACY_REPO_ROWS
+    assert 'configs' in _table_names(db_path)
+
+
+@xfailif_windows  # pragma: win32 no cover
+def test_killed_migration_is_finished_after_restart(tmpdir):
+    home = tmpdir.join('store').strpath
+    db_path = _write_legacy_db(home, with_configs=False)
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    env = {
+        **os.environ,
+        'PC_HOME': home,
+        'PC_REPO': repo_root,
+        'PYTHONPATH': (
+            repo_root + os.pathsep + os.environ.get('PYTHONPATH', '')
+        ),
+    }
+    crash_code = (
+        'import os\n'
+        'from pre_commit.store import Store, _SCHEMA_MIGRATIONS\n'
+        'def _crash(db):\n'
+        '    db.execute(\n'
+        "        'CREATE TABLE IF NOT EXISTS configs ('\n"
+        "        ' path TEXT NOT NULL, PRIMARY KEY (path))'\n"
+        '    )\n'
+        '    os._exit(7)\n'
+        '_SCHEMA_MIGRATIONS[1] = _crash\n'
+        "Store(os.environ['PC_HOME'])\n"
+    )
+    killed = subprocess.run(
+        (sys.executable, '-c', crash_code),
+        env=env, capture_output=True, text=True,
+    )
+    assert killed.returncode == 7
+    # the uncommitted migration left a hot journal behind
+    assert os.path.exists(db_path + '-journal')
+    assert _user_version(db_path) == 0
+
+    # restart in a fresh process: recovery + migration completes
+    resume_code = (
+        'import os\n'
+        'from pre_commit.store import Store\n'
+        'Store(os.environ["PC_HOME"])\n'
+    )
+    resumed = subprocess.run(
+        (sys.executable, '-c', resume_code),
+        env=env, capture_output=True, text=True,
+    )
+    assert resumed.returncode == 0, resumed.stderr
+
+    assert not os.path.exists(db_path + '-journal')
+    assert _user_version(db_path) == CURRENT_SCHEMA_VERSION
+    assert 'configs' in _table_names(db_path)
+    with sqlite3.connect(db_path) as db:
+        repos_rows = db.execute('SELECT * FROM repos').fetchall()
+        assert repos_rows == _LEGACY_REPO_ROWS
+
+
+def test_gc_and_mark_config_used_work_after_migration(tmpdir, cap_out):
+    home = tmpdir.join('store').strpath
+    db_path = _write_legacy_db(home, with_configs=False)
+    # remove rows so gc has nothing on disk to delete
+    with sqlite3.connect(db_path) as db:
+        db.execute('DELETE FROM repos')
+        db.commit()
+
+    store = Store(home)
+    assert gc(store) == 0
+    assert cap_out.get() == '0 repo(s) removed.\n'
+
+    cfg = tmpdir.join('cfg.yaml').ensure()
+    store.mark_config_used(cfg.strpath)
+    assert _select_all_configs(store) == [cfg.strpath]
+
+
+@xfailif_windows  # pragma: win32 no cover
+def test_readonly_legacy_cache_is_not_modified(tmpdir):
+    home = tmpdir.join('store').strpath
+    db_path = _write_legacy_db(home, with_configs=False)
+    write = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
+    os.chmod(db_path, os.stat(db_path).st_mode & ~write)
+    os.chmod(home, os.stat(home).st_mode & ~write)
+    try:
+        with pytest.raises(FatalError):
+            Store(home)
+        assert _user_version(db_path) == 0
+        assert 'configs' not in _table_names(db_path)
+    finally:
+        os.chmod(home, os.stat(home).st_mode | stat.S_IWUSR)
+        os.chmod(db_path, os.stat(db_path).st_mode | stat.S_IWUSR)
+
+
+def test_passive_open_never_writes_or_migrates(tmpdir):
+    """counter-proof: merely seeing that the schema is behind (the read-only
+    version probe, or opening with reconciliation disabled) must not be
+    mistaken for completing the migration."""
+    home = tmpdir.join('store').strpath
+    db_path = _write_legacy_db(home, with_configs=False)
+    before = _digest(db_path)
+
+    store = Store(home, reconcile_schema=False)
+    assert store._read_schema_versions() == (0, 1)
+
+    assert _user_version(db_path) == 0
+    assert 'configs' not in _table_names(db_path)
+    assert _digest(db_path) == before

@@ -13,6 +13,7 @@ import pre_commit.constants as C
 from pre_commit import clientlib
 from pre_commit import file_lock
 from pre_commit import git
+from pre_commit.errors import FatalError
 from pre_commit.util import CalledProcessError
 from pre_commit.util import clean_path_on_failure
 from pre_commit.util import cmd_output_b
@@ -20,6 +21,29 @@ from pre_commit.util import resource_text
 
 
 logger = logging.getLogger('pre_commit')
+
+
+#: schema version of the databases created and understood by this version
+#: of pre-commit.  the version is recorded in the database header via the
+#: sqlite `user_version` pragma.
+CURRENT_SCHEMA_VERSION = 2
+
+
+def _migrate_1_to_2(db: sqlite3.Connection) -> None:
+    # the `configs` table was added in schema version 2.  it was
+    # historically created lazily, so old caches may not have it.
+    db.execute(
+        'CREATE TABLE IF NOT EXISTS configs ('
+        '   path TEXT NOT NULL,'
+        '   PRIMARY KEY (path)'
+        ')',
+    )
+
+
+#: migrations indexed by the schema version they upgrade *from*.
+_SCHEMA_MIGRATIONS = {
+    1: _migrate_1_to_2,
+}
 
 
 def _get_default_directory() -> str:
@@ -59,7 +83,12 @@ def _make_local_repo(directory: str) -> None:
 class Store:
     get_default_directory = staticmethod(_get_default_directory)
 
-    def __init__(self, directory: str | None = None) -> None:
+    def __init__(
+            self,
+            directory: str | None = None,
+            *,
+            reconcile_schema: bool = True,
+    ) -> None:
         self.directory = directory or Store.get_default_directory()
         self.db_path = os.path.join(self.directory, 'db.db')
         self.readonly = (
@@ -76,10 +105,14 @@ class Store:
                 )
 
         if os.path.exists(self.db_path):
+            if reconcile_schema:
+                self._reconcile_schema()
             return
         with self.exclusive_lock():
             # Another process may have already completed this work
             if os.path.exists(self.db_path):  # pragma: no cover (race)
+                if reconcile_schema:
+                    self._reconcile_schema()
                 return
             # To avoid a race where someone ^Cs between db creation and
             # execution of the CREATE TABLE statement
@@ -88,6 +121,7 @@ class Store:
             os.close(fd)
             with self.connect(db_path=tmpfile) as db:
                 db.executescript(
+                    f'PRAGMA user_version = {CURRENT_SCHEMA_VERSION};\n'
                     'CREATE TABLE repos ('
                     '    repo TEXT NOT NULL,'
                     '    ref TEXT NOT NULL,'
@@ -99,6 +133,98 @@ class Store:
 
             # Atomic file move
             os.replace(tmpfile, self.db_path)
+
+    def _future_schema_error(self, version: int) -> FatalError:
+        return FatalError(
+            f'the pre-commit cache at {self.db_path} was written by a '
+            f'newer version of pre-commit (database schema version '
+            f'{version}, this version understands at most '
+            f'{CURRENT_SCHEMA_VERSION}).  refusing to modify it -- upgrade '
+            f'pre-commit or remove the cache directory ({self.directory})',
+        )
+
+    def _read_schema_versions(self) -> tuple[int, int]:
+        """Return ``(recorded, effective)`` versions without writing.
+
+        ``recorded`` is the version in the sqlite `user_version` header.
+        Databases written before schema versioning existed record no
+        version (``recorded == 0``); their effective version is inferred
+        from the tables they contain.
+        """
+        with contextlib.closing(
+            sqlite3.connect(f'file:{self.db_path}?mode=ro', uri=True),
+        ) as db:
+            recorded = db.execute('PRAGMA user_version').fetchone()[0]
+            if recorded != 0:
+                return recorded, recorded
+            tables = {
+                row[0]
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'",
+                )
+            }
+            if 'repos' not in tables:
+                raise FatalError(
+                    f'unrecognized database at {self.db_path}: it is not '
+                    f'a pre-commit cache (missing the `repos` table)',
+                )
+            # the `configs` table was introduced in schema version 2
+            effective = 2 if 'configs' in tables else 1
+            return 0, effective
+
+    def _reconcile_schema(self) -> None:
+        """Bring the cache database up to date with this pre-commit version.
+
+        * a current database is left completely untouched (no writes)
+        * a database written by a newer pre-commit is never modified; a
+          FatalError is raised instead (the command exits non-zero)
+        * an older database is migrated forward, preserving every row;
+          migration runs inside a single sqlite transaction, so being
+          interrupted (or failing) leaves the database in its
+          pre-migration state and re-running simply continues
+        """
+        recorded, version = self._read_schema_versions()
+        if version > CURRENT_SCHEMA_VERSION:
+            raise self._future_schema_error(version)
+        if recorded == CURRENT_SCHEMA_VERSION:
+            return
+        if self.readonly:  # pragma: win32 no cover
+            raise FatalError(
+                f'the pre-commit cache at {self.db_path} uses database '
+                f'schema version {version}, but the cache directory is not '
+                f'writable so it cannot be migrated to version '
+                f'{CURRENT_SCHEMA_VERSION}',
+            )
+
+        with self.exclusive_lock():
+            # another process may have finished the migration while we
+            # waited for the lock
+            recorded, version = self._read_schema_versions()
+            if version > CURRENT_SCHEMA_VERSION:  # pragma: no cover (race)
+                raise self._future_schema_error(version)
+            if recorded == CURRENT_SCHEMA_VERSION:  # pragma: no cover (race)
+                return
+
+            with contextlib.closing(sqlite3.connect(self.db_path)) as db:
+                # the transaction is managed explicitly: python's sqlite3
+                # legacy transaction control does not auto-open
+                # transactions around DDL, so a plain `with db:` block
+                # would commit the migration statement by statement.
+                db.isolation_level = None
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    while version < CURRENT_SCHEMA_VERSION:
+                        _SCHEMA_MIGRATIONS[version](db)
+                        version += 1
+                    # record the converged version.  this also stamps
+                    # databases which already had the current tables but
+                    # were written before versioning was recorded
+                    db.execute(f'PRAGMA user_version = {version}')
+                except BaseException:
+                    db.execute('ROLLBACK')
+                    raise
+                else:
+                    db.execute('COMMIT')
 
     @contextlib.contextmanager
     def exclusive_lock(self) -> Generator[None]:

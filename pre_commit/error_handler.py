@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
 import os.path
 import sys
 import traceback
@@ -28,7 +29,10 @@ def _log_and_exit(
     _, git_version_b, _ = cmd_output_b('git', '--version', check=False)
     git_version = git_version_b.decode(errors='backslashreplace').rstrip()
 
-    storedir = Store().directory
+    # don't construct a `Store` here -- the error may have come from one,
+    # and constructing another would raise while trying to report it
+    storedir = Store.get_default_directory()
+    os.makedirs(storedir, exist_ok=True)
     log_path = os.path.join(storedir, 'pre-commit.log')
     with contextlib.ExitStack() as ctx:
         if os.access(storedir, os.W_OK):
