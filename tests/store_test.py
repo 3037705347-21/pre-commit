@@ -13,6 +13,7 @@ import pre_commit.constants as C
 from pre_commit import git
 from pre_commit.store import _get_default_directory
 from pre_commit.store import _LOCAL_RESOURCES
+from pre_commit.store import _make_local_repo
 from pre_commit.store import Store
 from pre_commit.util import CalledProcessError
 from pre_commit.util import cmd_output
@@ -341,3 +342,75 @@ def test_clone_with_recursive_submodules(store, tmp_path):
     assert os.path.exists(ret)
     assert os.path.exists(os.path.join(ret, str(repo), 'repository'))
     assert os.path.exists(os.path.join(ret, str(sub), 'submodule'))
+
+
+def test_make_local_repo_only_writes_changed_files(tmp_path):
+    # a non-template file must be left untouched
+    extra = tmp_path.joinpath('not_a_template_file')
+    extra.write_text('extra')
+    # a template file with stale contents must be updated
+    stale = tmp_path.joinpath('setup.py')
+    stale.write_text('STALE')
+
+    _make_local_repo(str(tmp_path))
+
+    assert extra.read_text() == 'extra'
+    assert stale.read_text() != 'STALE'
+
+
+def test_make_local_repo_skips_when_contents_match(tmp_path):
+    _make_local_repo(str(tmp_path))
+    setup_py = tmp_path.joinpath('setup.py')
+    before = setup_py.stat().st_mtime_ns
+
+    # running again must not rewrite an already-up-to-date file
+    _make_local_repo(str(tmp_path))
+
+    assert setup_py.stat().st_mtime_ns == before
+
+
+def test_make_local_repo_preserves_original_on_failure(tmp_path):
+    from pre_commit import store
+    target = tmp_path.joinpath('setup.py')
+    target.write_text('STALE')
+
+    with mock.patch.object(
+            store.tempfile, 'NamedTemporaryFile', side_effect=OSError,
+    ):
+        with pytest.raises(OSError):
+            _make_local_repo(str(tmp_path))
+
+    # the original file must be left intact
+    assert target.read_text() == 'STALE'
+
+
+def test_make_local_reconciles_existing_repo(store):
+    path = store.make_local(())
+
+    # simulate a stale template file and an installed environment
+    setup_py = os.path.join(path, 'setup.py')
+    with open(setup_py, 'w') as f:
+        f.write('STALE')
+    env_dir = os.path.join(path, 'py_env-python3')
+    os.mkdir(env_dir)
+    with open(os.path.join(env_dir, 'marker'), 'w') as f:
+        f.write('env')
+
+    # calling make_local again reuses the directory and reconciles it
+    path2 = store.make_local(())
+    assert path2 == path
+
+    with open(setup_py) as f:
+        assert f.read() != 'STALE'
+    # installed environment and other non-template files are untouched
+    assert os.path.exists(os.path.join(env_dir, 'marker'))
+
+
+def test_make_local_does_not_rewrite_unchanged_repo(store):
+    path = store.make_local(())
+    setup_py = os.path.join(path, 'setup.py')
+    before = os.stat(setup_py).st_mtime_ns
+
+    store.make_local(())
+
+    assert os.stat(setup_py).st_mtime_ns == before

@@ -51,9 +51,23 @@ def _make_local_repo(directory: str) -> None:
         contents = resource_text(f'empty_template_{resource_basename}')
         target_dir = os.path.join(directory, resource_dirname)
         target_file = os.path.join(target_dir, resource_basename)
+
+        # If the file already has the expected contents, leave it alone --
+        # this avoids touching installed environments or anything else that
+        # isn't part of the template.
+        with contextlib.suppress(OSError), open(target_file) as f:
+            if f.read() == contents:
+                continue
+
         os.makedirs(target_dir, exist_ok=True)
-        with open(target_file, 'w') as f:
-            f.write(contents)
+        # Write to a temp file first and atomically replace so that a failure
+        # (partial write, disk full, etc.) leaves the original file intact.
+        with tempfile.NamedTemporaryFile(
+                'w', dir=target_dir, delete=False,
+        ) as tmp:
+            tmp.write(contents)
+            tmp_name = tmp.name
+        os.replace(tmp_name, target_file)
 
 
 class Store:
@@ -210,9 +224,16 @@ class Store:
         return self._new_repo(repo, ref, deps, clone_strategy)
 
     def make_local(self, deps: Sequence[str]) -> str:
-        return self._new_repo(
+        path = self._new_repo(
             'local', C.LOCAL_REPO_VERSION, deps, _make_local_repo,
         )
+        # The template may have changed since this local repo was created
+        # (e.g. after upgrading pre-commit).  Reconcile the placeholder files
+        # in place so they match the current template.  Installed environments
+        # and any other non-template files are left untouched, and a failure
+        # here leaves the directory as it was.
+        _make_local_repo(path)
+        return path
 
     def _create_configs_table(self, db: sqlite3.Connection) -> None:
         db.executescript(
