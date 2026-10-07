@@ -13,6 +13,7 @@ import pre_commit.constants as C
 from pre_commit import clientlib
 from pre_commit import file_lock
 from pre_commit import git
+from pre_commit.errors import FatalError
 from pre_commit.util import CalledProcessError
 from pre_commit.util import clean_path_on_failure
 from pre_commit.util import cmd_output_b
@@ -20,6 +21,14 @@ from pre_commit.util import resource_text
 
 
 logger = logging.getLogger('pre_commit')
+
+
+# the schema version understood by this release, stored in the database via
+# `PRAGMA user_version`.
+# a database at version 0 was written by a release which never recorded a
+# version.  when the on-disk structure changes, bump this and register the
+# upgrade in `_MIGRATIONS` (keyed by the version it upgrades to).
+SCHEMA_VERSION = 1
 
 
 def _get_default_directory() -> str:
@@ -76,10 +85,12 @@ class Store:
                 )
 
         if os.path.exists(self.db_path):
+            self._reconcile_schema()
             return
         with self.exclusive_lock():
             # Another process may have already completed this work
             if os.path.exists(self.db_path):  # pragma: no cover (race)
+                self._reconcile_schema()
                 return
             # To avoid a race where someone ^Cs between db creation and
             # execution of the CREATE TABLE statement
@@ -96,6 +107,7 @@ class Store:
                     ');',
                 )
                 self._create_configs_table(db)
+                db.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
 
             # Atomic file move
             os.replace(tmpfile, self.db_path)
@@ -121,6 +133,81 @@ class Store:
             # this creates a transaction
             with db:
                 yield db
+
+    @staticmethod
+    def _get_user_version(db: sqlite3.Connection) -> int:
+        return db.execute('PRAGMA user_version').fetchone()[0]
+
+    def _newer_version_error(self, version: int) -> FatalError:
+        return FatalError(
+            f'the cache database {self.db_path} was written by a newer '
+            f'version of pre-commit (schema version {version}, but this '
+            f'release understands up to {SCHEMA_VERSION}).  refusing to '
+            f'modify it -- upgrade pre-commit or use a separate cache '
+            f'directory (PRE_COMMIT_HOME).',
+        )
+
+    @contextlib.contextmanager
+    def _transaction(
+        self,
+    ) -> Generator[sqlite3.Connection]:
+        """An explicit, atomic write transaction.
+
+        the driver's implicit transaction handling is disabled so that the
+        schema changes together with the version bump either all commit or
+        are all rolled back.
+        """
+        with self.connect() as db:
+            db.isolation_level = None  # autocommit: we drive the transaction
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                yield db
+            except BaseException:
+                db.execute('ROLLBACK')
+                raise
+            else:
+                db.execute('COMMIT')
+
+    def _reconcile_schema(self) -> None:
+        """Bring the database to the schema version understood here.
+
+        * current version -- nothing to do
+        * older version   -- pending migrations are applied in order; the
+                             existing repositories and configuration records
+                             are preserved
+        * newer version   -- the database is left untouched and a fatal
+                             error is raised
+
+        the upgrade runs inside a single transaction, so a failure never
+        leaves a partially modified schema behind.
+        """
+        with self.connect() as db:
+            version = self._get_user_version(db)
+
+        if version == SCHEMA_VERSION:
+            return
+        elif version > SCHEMA_VERSION:
+            raise self._newer_version_error(version)
+        elif self.readonly:  # pragma: win32 no cover
+            # cannot upgrade a read-only cache -- leave it untouched
+            return
+
+        logger.info(
+            f'upgrading pre-commit cache database schema '
+            f'{version} -> {SCHEMA_VERSION}',
+        )
+        with self.exclusive_lock():
+            # re-check under the lock: another process may have migrated
+            with self._transaction() as db:
+                version = self._get_user_version(db)
+                if version == SCHEMA_VERSION:  # pragma: no cover (race)
+                    return
+                elif version > SCHEMA_VERSION:  # pragma: no cover (race)
+                    raise self._newer_version_error(version)
+
+                for to_version in range(version + 1, SCHEMA_VERSION + 1):
+                    _MIGRATIONS[to_version](db)
+                db.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
 
     @classmethod
     def db_repo_name(cls, repo: str, deps: Sequence[str]) -> str:
@@ -214,12 +301,13 @@ class Store:
             'local', C.LOCAL_REPO_VERSION, deps, _make_local_repo,
         )
 
-    def _create_configs_table(self, db: sqlite3.Connection) -> None:
-        db.executescript(
+    @staticmethod
+    def _create_configs_table(db: sqlite3.Connection) -> None:
+        db.execute(
             'CREATE TABLE IF NOT EXISTS configs ('
             '   path TEXT NOT NULL,'
             '   PRIMARY KEY (path)'
-            ');',
+            ')',
         )
 
     def mark_config_used(self, path: str) -> None:
@@ -233,3 +321,12 @@ class Store:
             # TODO: eventually remove this and only create in _create
             self._create_configs_table(db)
             db.execute('INSERT OR IGNORE INTO configs VALUES (?)', (path,))
+
+
+# database upgrades, keyed by the schema version they upgrade to.
+# version 0 databases were created by releases which did not record a
+# version: they always contain the `repos` table but pre-date the `configs`
+# table, which the version 1 upgrade creates when it is missing.
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    1: Store._create_configs_table,
+}

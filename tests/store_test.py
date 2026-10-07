@@ -11,6 +11,8 @@ import pytest
 
 import pre_commit.constants as C
 from pre_commit import git
+from pre_commit import store as store_mod
+from pre_commit.errors import FatalError
 from pre_commit.store import _get_default_directory
 from pre_commit.store import _LOCAL_RESOURCES
 from pre_commit.store import Store
@@ -31,6 +33,20 @@ def _select_all_configs(store: Store) -> list[str]:
 def _select_all_repos(store: Store) -> list[tuple[str, str, str]]:
     with store.connect() as db:
         return db.execute('SELECT repo, ref, path FROM repos').fetchall()
+
+
+def _user_version(store: Store) -> int:
+    with sqlite3.connect(store.db_path) as db:
+        return db.execute('PRAGMA user_version').fetchone()[0]
+
+
+def _table_names(store: Store) -> list[str]:
+    with sqlite3.connect(store.db_path) as db:
+        return [
+            name for name, in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'",
+            )
+        ]
 
 
 def test_our_session_fixture_works():
@@ -256,6 +272,64 @@ def test_create_when_directory_exists_but_not_db(store):
 def test_create_when_store_already_exists(store):
     # an assertion that this is idempotent and does not crash
     Store(store.directory)
+
+
+def test_new_database_is_stamped_with_schema_version(store):
+    assert _user_version(store) == store_mod.SCHEMA_VERSION
+
+
+def test_legacy_database_is_upgraded_and_data_preserved(store):
+    # turn the database into one written by a release which did not know
+    # about schema versions: user_version 0 and no `configs` table
+    with sqlite3.connect(store.db_path) as db:
+        db.execute('PRAGMA user_version = 0')
+        db.execute('DROP TABLE configs')
+        db.execute(
+            'INSERT INTO repos (repo, ref, path) VALUES (?, ?, ?)',
+            ('fake_repo', 'fake_ref', 'fake_path'),
+        )
+
+    # opening the store brings it up to the current version
+    Store(store.directory)
+
+    assert _user_version(store) == store_mod.SCHEMA_VERSION
+    assert 'configs' in _table_names(store)
+    # the existing repository record survived the upgrade
+    assert _select_all_repos(store) == [
+        ('fake_repo', 'fake_ref', 'fake_path'),
+    ]
+
+
+def test_newer_database_is_not_modified(store):
+    newer_version = store_mod.SCHEMA_VERSION + 1
+    with sqlite3.connect(store.db_path) as db:
+        db.execute(f'PRAGMA user_version = {newer_version}')
+
+    with pytest.raises(FatalError):
+        Store(store.directory)
+
+    # the database from the newer release is left untouched
+    assert _user_version(store) == newer_version
+
+
+def test_failed_upgrade_rolls_back(store):
+    # make an unversioned database missing the configs table
+    with sqlite3.connect(store.db_path) as db:
+        db.execute('PRAGMA user_version = 0')
+        db.execute('DROP TABLE configs')
+
+    def _failing_migration(db):
+        db.execute('CREATE TABLE should_not_remain (x INTEGER)')
+        raise AssertionError('boom')
+
+    with mock.patch.dict(store_mod._MIGRATIONS, {1: _failing_migration}):
+        with pytest.raises(AssertionError):
+            Store(store.directory)
+
+    # version is unchanged and the partially created table was rolled back
+    assert _user_version(store) == 0
+    assert 'should_not_remain' not in _table_names(store)
+    assert 'configs' not in _table_names(store)
 
 
 def test_db_repo_name(store):

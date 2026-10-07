@@ -16,6 +16,16 @@ from pre_commit.util import cmd_output_b
 from pre_commit.util import force_bytes
 
 
+def _store_dir() -> str:
+    try:
+        return Store().directory
+    except FatalError:
+        # opening the store can fail (for example a cache database written
+        # by a newer pre-commit) -- still compute the directory so the log
+        # can be written, without touching the database.
+        return Store.get_default_directory()
+
+
 def _log_and_exit(
     msg: str,
     ret_code: int,
@@ -28,7 +38,7 @@ def _log_and_exit(
     _, git_version_b, _ = cmd_output_b('git', '--version', check=False)
     git_version = git_version_b.decode(errors='backslashreplace').rstrip()
 
-    storedir = Store().directory
+    storedir = _store_dir()
     log_path = os.path.join(storedir, 'pre-commit.log')
     with contextlib.ExitStack() as ctx:
         if os.access(storedir, os.W_OK):
