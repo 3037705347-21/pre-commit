@@ -18,41 +18,63 @@ from pre_commit.yaml import yaml_dump
 logger = logging.getLogger(__name__)
 
 
-def _repo_ref(tmpdir: str, repo: str, ref: str | None) -> tuple[str, str]:
+def _repo_ref(
+        store: Store,
+        repo: str,
+        ref: str | None,
+) -> tuple[str, str, bool]:
     # if `ref` is explicitly passed, use it
     if ref is not None:
-        return repo, ref
+        return repo, ref, False
 
     ref = git.head_rev(repo)
     # if it exists on disk, we'll try and clone it with the local changes
     if os.path.exists(repo) and git.has_diff('HEAD', repo=repo):
         logger.warning('Creating temporary repo with uncommitted changes...')
 
-        shadow = os.path.join(tmpdir, 'shadow-repo')
-        cmd_output_b('git', 'clone', repo, shadow)
-        cmd_output_b('git', 'checkout', ref, '-b', '_pc_tmp', cwd=shadow)
+        with store.exclusive_lock():
+            # the shadow lives in the store (rather than a temp directory) so
+            # repeated runs reuse both its identity and the installed
+            # environments
+            shadow = store.try_repo_path(repo)
+            os.makedirs(os.path.dirname(shadow), exist_ok=True)
+            source = os.path.abspath(repo)
+            if os.path.exists(shadow):
+                # pick up new commits from the source repository
+                cmd_output_b('git', 'fetch', 'origin', cwd=shadow)
+            else:
+                cmd_output_b('git', 'clone', source, shadow)
 
-        idx = git.git_path('index', repo=shadow)
-        objs = git.git_path('objects', repo=shadow)
-        env = dict(os.environ, GIT_INDEX_FILE=idx, GIT_OBJECT_DIRECTORY=objs)
+            # `-f` discards the tree left by the previous `try-repo` run
+            cmd_output_b(
+                'git', 'checkout', '-f', ref, '-B', '_pc_tmp', cwd=shadow,
+            )
 
-        staged_files = git.get_staged_files(cwd=repo)
-        if staged_files:
-            xargs(('git', 'add', '--'), staged_files, cwd=repo, env=env)
+            idx = git.git_path('index', repo=shadow)
+            objs = git.git_path('objects', repo=shadow)
+            env = dict(
+                os.environ,
+                GIT_INDEX_FILE=idx,
+                GIT_OBJECT_DIRECTORY=objs,
+            )
 
-        cmd_output_b('git', 'add', '-u', cwd=repo, env=env)
-        git.commit(repo=shadow)
+            staged_files = git.get_staged_files(cwd=repo)
+            if staged_files:
+                xargs(('git', 'add', '--'), staged_files, cwd=repo, env=env)
 
-        return shadow, git.head_rev(shadow)
+            cmd_output_b('git', 'add', '-u', cwd=repo, env=env)
+            git.commit(repo=shadow)
+
+            return shadow, git.head_rev(shadow), True
     else:
-        return repo, ref
+        return repo, ref, False
 
 
 def try_repo(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory() as tempdir:
-        repo, ref = _repo_ref(tempdir, args.repo, args.ref)
+        store = Store()
+        repo, ref, is_shadow = _repo_ref(store, args.repo, args.ref)
 
-        store = Store(tempdir)
         if args.hook:
             hooks = [{'id': args.hook}]
         else:
@@ -74,4 +96,10 @@ def try_repo(args: argparse.Namespace) -> int:
         output.write(config_s)
         output.write_line('=' * 79)
 
-        return run(config_filename, store, args)
+        ret = run(config_filename, store, args)
+
+        if is_shadow:
+            # environments for previous revisions are no longer needed
+            store.prune_try_repo(repo, ref)
+
+        return ret

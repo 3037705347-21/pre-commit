@@ -198,6 +198,10 @@ def commit(repo: str = '.') -> None:
     name, email = 'pre-commit', 'asottile+pre-commit@umich.edu'
     env['GIT_AUTHOR_NAME'] = env['GIT_COMMITTER_NAME'] = name
     env['GIT_AUTHOR_EMAIL'] = env['GIT_COMMITTER_EMAIL'] = email
+    # use a fixed date so the same tree produces the same commit sha --
+    # this lets `try-repo` reuse environments for identical content
+    when = '1970-01-01T00:00:00+0000'
+    env['GIT_AUTHOR_DATE'] = env['GIT_COMMITTER_DATE'] = when
     cmd = ('git', 'commit', '--no-edit', '--no-gpg-sign', '-n', '-minit')
     cmd_output_b(*cmd, cwd=repo, env=env)
 

@@ -319,6 +319,58 @@ def test_mark_config_as_used_readonly(tmpdir):
     assert _select_all_configs(store) == []
 
 
+def test_try_repo_path_is_stable_for_a_repository(store):
+    ret = store.try_repo_path('/path/to/some-repo')
+    parent, name = os.path.split(ret)
+    assert parent == os.path.join(store.directory, 'try-repo')
+    assert name.startswith('some-repo-')
+    # identical input always maps to the same location
+    assert store.try_repo_path('/path/to/some-repo') == ret
+    # different repositories get different locations
+    assert store.try_repo_path('/path/to/other-repo') != ret
+    # relative paths resolve against the current directory
+    assert (
+        store.try_repo_path('some-repo')
+        == store.try_repo_path(os.path.abspath('some-repo'))
+    )
+
+
+def test_prune_try_repo(store):
+    shadow = os.path.join(store.directory, 'try-repo', 'repo-abcdef')
+    os.makedirs(shadow)
+    cmd_output('git', 'init', '.', cwd=shadow)
+
+    old = os.path.join(store.directory, 'repoold')
+    old_dep = os.path.join(store.directory, 'repoolddep')
+    new = os.path.join(store.directory, 'reponew')
+    other = os.path.join(store.directory, 'repoother')
+    for directory in (old, old_dep, new, other):
+        os.makedirs(directory)
+
+    with sqlite3.connect(store.db_path) as db:
+        db.executemany(
+            'INSERT INTO repos (repo, ref, path) VALUES (?, ?, ?)',
+            [
+                (shadow, 'old-ref', old),
+                (f'{shadow}:some-dep', 'old-ref', old_dep),
+                (shadow, 'new-ref', new),
+                # an unrelated repository must be left alone
+                (other, 'old-ref', other),
+            ],
+        )
+
+    store.prune_try_repo(shadow, 'new-ref')
+
+    assert _select_all_repos(store) == [
+        (shadow, 'new-ref', new),
+        (other, 'old-ref', other),
+    ]
+    assert not os.path.exists(old)
+    assert not os.path.exists(old_dep)
+    assert os.path.exists(new)
+    assert os.path.exists(other)
+
+
 def test_clone_with_recursive_submodules(store, tmp_path):
     sub = tmp_path.joinpath('sub')
     sub.mkdir()

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import os.path
+import re
 import sqlite3
 import tempfile
 from collections.abc import Callable
@@ -17,6 +19,7 @@ from pre_commit.util import CalledProcessError
 from pre_commit.util import clean_path_on_failure
 from pre_commit.util import cmd_output_b
 from pre_commit.util import resource_text
+from pre_commit.util import rmtree
 
 
 logger = logging.getLogger('pre_commit')
@@ -213,6 +216,61 @@ class Store:
         return self._new_repo(
             'local', C.LOCAL_REPO_VERSION, deps, _make_local_repo,
         )
+
+    def try_repo_path(self, repo: str) -> str:
+        """The stable location of a `try-repo` shadow clone of `repo`.
+
+        Repeated runs against the same repository reuse this directory --
+        this keeps the cache identity (a content-based commit sha) stable
+        and provides a permanent clone source even after the temporary
+        working directory is gone.
+        """
+        repo = os.path.abspath(repo)
+        digest = hashlib.sha1(repo.encode()).hexdigest()[:12]
+        name = os.path.basename(repo.rstrip('/\\')) or 'repo'
+        name = re.sub(r'[^A-Za-z0-9._-]+', '-', name)[:32].strip('-')
+        return os.path.join(
+            self.directory, 'try-repo', f'{name or "repo"}-{digest}',
+        )
+
+    def prune_try_repo(self, repo: str, ref: str) -> None:
+        """Remove cached clones (and environments) of a `try-repo` shadow
+        at any ref other than `ref`.
+
+        This sweeps the entries superseded by a new content revision while
+        leaving entries for every other repository untouched.
+        """
+        if self.readonly:  # pragma: win32 no cover
+            return
+
+        with self.exclusive_lock():
+            with self.connect() as db:
+                rows = db.execute(
+                    'SELECT repo, ref, path FROM repos WHERE ref != ?',
+                    (ref,),
+                ).fetchall()
+                stale = [
+                    (name, old_ref, path)
+                    for name, old_ref, path in rows
+                    if name == repo or name.startswith(f'{repo}:')
+                ]
+                if stale:
+                    db.executemany(
+                        'DELETE FROM repos WHERE repo = ? AND ref = ?',
+                        [(name, old_ref) for name, old_ref, _ in stale],
+                    )
+
+            if not stale:
+                return
+
+            for _, _, path in stale:
+                rmtree(path)
+
+            # drop objects belonging to the replaced shadow commits
+            cmd_output_b(
+                'git', 'gc', '--prune=now', cwd=repo, check=False,
+                env=git.no_git_env(),
+            )
 
     def _create_configs_table(self, db: sqlite3.Connection) -> None:
         db.executescript(
